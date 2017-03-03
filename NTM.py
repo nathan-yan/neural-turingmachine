@@ -26,6 +26,8 @@ class head:
 
         self.memory_locations = memory_locations
         self.memory_size = memory_size 
+
+        self.mask = np.zeros(shape = (memory_locations))
     
     def forward(self, controller_out):
         # key - batchsize x memory_size
@@ -36,7 +38,9 @@ class head:
         key = T.dot(controller_out, self.w_key)
         strength = T.dot(controller_out, self.w_strength)
         interpolation = T.nnet.sigmoid(T.dot(controller_out, self.w_interpolation))
-        shift = T.nnet.softmax(T.dot(controller_out, self.w_shift))
+        shift = T.dot(controller_out, self.w_shift)
+        shift *= mask 
+        
         sharpen = T.dot(controller_out, self.w_sharpen)
 
         return key, strength, interpolation, shift, sharpen 
@@ -80,8 +84,8 @@ class NTM:
         self.E = np.ones(shape = (self.batchsize, self.memory_locations, self.memory_size))
         self.shift_template = np.zeros(shape = (self.memory_locations, self.batchsize))
 
-        self.erase_params = init_weights(controller_hidden, self.memory_locations)
-        self.add_params = init_weights(controller_hidden, self.memory_locations)
+        self.erase_params = init_weights(controller_hidden, self.memory_size)
+        self.add_params = init_weights(controller_hidden, self.memory_size)
 
         self.params = []
 
@@ -106,8 +110,14 @@ class NTM:
             return r_t 
             
         def write(memory, w_w, e, v):
-            M_ = T.mul(memory, (self.E - T.batched_dot(w_w.dimshuffle([0, 1, 'x']), e.dimshuffle([0, 'x', 1]))))
-            M = M_ + T.batched_dot(w_w.dimshuffle([0, 1, 'x']), v.dimshuffle([0, 'x', 1]))
+            # w_w is of shape batchsize x mem_loc 
+            # e is of shape batchsize x mem_size 
+
+            # w_w is of shape batchsize x mem_loc x 1 
+            # e is of shape batchsize x 1 x mem_loc 
+
+            M_ = T.mul(memory, (1 - T.batched_dot(w_w.dimshuffle([0, 1, 'x']), e.dimshuffle([0, 'x', 1]))))
+            M = M_ + T.batched_dot(w_w.dimshuffle([0, 1, 'x']), v.dimshuffle([0, 'x', 1])) 
 
             return M
         
@@ -135,7 +145,7 @@ class NTM:
                 image_shape=(1, w), 
                 border_mode='full')
             corr_len = corr_expr.shape[1]
-            pad = w - corr_len%w    
+            pad = w - corr_len % w    
             v_padded = T.concatenate([corr_expr, T.zeros((bs, pad))], axis=1)
             circ_corr_exp = T.sum(v_padded.reshape((bs, v_padded.shape[1] // w, w)), axis=1)
 
@@ -154,7 +164,7 @@ class NTM:
             controller_hidden = r_fc + i_fc    # batchsize x controller_hidden
             controller_hidden = T.nnet.relu(controller_hidden)  # batchsize x controller_hidden
 
-            output = T.dot(controller_hidden, self.cn_w2)   # batchsize x controller_output
+            output = T.nnet.sigmoid(.dot(controller_hidden, self.cn_w2))   # batchsize x controller_output
             loss += T.mean(.5 * T.sum((output - target) ** 2, axis = 1))  # scalar 
 
             erase_vector = T.nnet.sigmoid(T.dot(controller_hidden, self.erase_params))  # batchsize x mem_loc
@@ -218,7 +228,7 @@ class NTM:
                 weightings.append(sharpened_weight)
                 
                 reads.append(read(memory, sharpened_weight))
-            
+                
             reads = T.concatenate(reads, axis = 1)
             weightings = T.stack(weightings)
             
