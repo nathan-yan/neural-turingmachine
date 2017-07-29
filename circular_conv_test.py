@@ -22,7 +22,7 @@ shift = T.matrix()
 # 32 is our example memory size
 # batchsize is 2 
 
-def circular_convolution_column(weight_idx, shift, weighting):
+def circular_convolution(weight_idx, shift, weighting):
     def conv(shift_idx, current_value, shift, weight_idx, weighting):
         current_value += weighting[:, shift_idx] * shift[:, (weight_idx - shift_idx)%5]
 
@@ -32,16 +32,16 @@ def circular_convolution_column(weight_idx, shift, weighting):
 
     return columns[-1]
 
-def circular_convolution(weightings, shift):
-    conv, updates = theano.scan(fn = circular_convolution_column, sequences = [theano.tensor.arange(5)], non_sequences = [shift, weightings])
+def focus_shift(weightings, shift):
+    conv, updates = theano.scan(fn = circular_convolution, sequences = [theano.tensor.arange(5)], non_sequences = [shift, weightings])
 
     return conv
 
-f = theano.function([weightings, shift], [circular_convolution(weightings, shift)])
+f = theano.function([weightings, shift], [focus_shift(weightings, shift)])
 
 weight = np.array([[0, 0, 0, 0, 1], [1, 2, 3, 4, 5]])
 shifts = np.array([[.9, .1, 0, 0, 0], [0, 0, 0, 0, 1]])
 
 print(weight)
-print(f(weight, shifts)[0].T) 
+print(f(weight, shifts)[0].shape) 
 # returns shape 5 x 2
