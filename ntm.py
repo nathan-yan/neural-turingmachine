@@ -127,6 +127,6 @@ def test():
 def main():
     pass 
 
-main()
+test()
 
 
