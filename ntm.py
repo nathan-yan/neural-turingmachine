@@ -76,8 +76,8 @@ def mem_focus(memory, key, strength):
 
     return weighting
 
-def main():
-    # <mem_write and read TEST>
+def test():
+     # <mem_write and read TEST>
     # memory -> 2 x 4 x 3
     memory = np.array([[[1, 1, 1, 1], [1, 2, 1, 2],[8, 1, 1, 3]], [[20, 2, 3, 4], [1, 1, 2, 3], [2, 1, 10, 1]]]).transpose([0, 2, 1])
     print(memory)
@@ -123,6 +123,9 @@ def main():
     f = theano.function([m, k, s], w_F)
     print(f(memory, key, strength))
     # </mem_focus TEST> PASSED
+
+def main():
+    pass 
 
 main()
 
