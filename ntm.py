@@ -6,6 +6,8 @@ from matplotlib import pyplot as plt
 
 # * indicates that a dimension is broadcastable
 
+SMALL_CONSTANT = 1e-5
+
 class NTM:
     def __init__(self, controller, output_size,
                  memory_slots = 32, slot_size = 10,
@@ -107,7 +109,7 @@ class NTM:
 
             # Normalize
             # T.sum(...) -> batchsize x 1
-            final_weight = sharpened_weight / T.sum(sharpened_weight, axis = 1, keepdims = True)
+            final_weight = sharpened_weight / (T.sum(sharpened_weight, axis = 1, keepdims = True) + SMALL_CONSTANT)
 
             # read, read, read!
             # read_vec -> batchsize x N x 1, so we gotta flatten to batchsize x N 
@@ -140,7 +142,7 @@ class NTM:
 
         # Normalize
         # T.sum(...) -> batchsize x 1
-        final_weight = sharpened_weight / T.sum(sharpened_weight, axis = 1, keepdims = True)
+        final_weight = sharpened_weight / (T.sum(sharpened_weight, axis = 1, keepdims = True) + SMALL_CONSTANT)
 
         previous_weights = T.set_subtensor(previous_weights[-1], final_weight)
         
@@ -161,7 +163,7 @@ class NTM:
      #external_input, memory, read_vectors, previous_weights
 
     def process(self, data):
-        [memory_states, read_vector_states, previous_weight_states, output_states], updates = theano.scan(fn = self.process_step, sequences = data, outputs_info = [theano.shared(np.random.randn(self.batch_size, self.slot_size, self.memory_slots) * 0.05), T.zeros(shape = [len(self.read_heads), self.batch_size, self.slot_size]), T.zeros(shape = [len(self.read_heads) + 1, self.batch_size, self.memory_slots]), None])
+        [memory_states, read_vector_states, previous_weight_states, output_states], updates = theano.scan(fn = self.process_step, sequences = data, outputs_info = [theano.shared(np.random.randn(self.batch_size, self.slot_size, self.memory_slots) * 0.05), T.zeros(shape = [len(self.read_heads), self.batch_size, self.slot_size]) + SMALL_CONSTANT, T.zeros(shape = [len(self.read_heads) + 1, self.batch_size, self.memory_slots]) + SMALL_CONSTANT, None])
 
         return memory_states, read_vector_states, previous_weight_states, output_states
 
@@ -368,7 +370,7 @@ def mem_focus(memory, key, strength):
     multiplied_magnitude = (memory_magnitude * key_magnitude).dimshuffle([0, 'x', 1])
 
     # cosine_similarity -> batchsize x 1 x M
-    cosine_similarity = dot/multiplied_magnitude
+    cosine_similarity = dot/(multiplied_magnitude + SMALL_CONSTANT)
 
     # strengthened_cosine_similarity -> batchsize x 1 x M
     strengthened_cosine_similarity = cosine_similarity * strength.dimshuffle([0, 1, 'x'])
@@ -652,7 +654,7 @@ def main():
     # ntm_outputs - target ** 2 -> ts x batchsize x bits
     # 
 
-    loss = T.mean(T.mean(T.sum(.5 * (ntm_outputs - target) ** 2, axis = 2), axis = 1), axis = 0)
+    loss = T.sum(T.mean(T.sum(.5 * (ntm_outputs - target) ** 2, axis = 2), axis = 1), axis = 0)
 
     updates = RMSprop(cost = loss, params = ntm.weights, lr = 1e-3)
     
@@ -686,8 +688,8 @@ def main():
         outputs = outputs[-2]
         outputs = outputs[:, 0, :]
         
-        #plt.imshow(outputs)
-        #plt.show()
+        plt.imshow(outputs)
+        plt.show()
     
 
         """
