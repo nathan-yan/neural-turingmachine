@@ -7,11 +7,27 @@ from matplotlib import pyplot as plt
 # * indicates that a dimension is broadcastable
 
 class NTM:
-    def __init__(self, controller_size = 100,
+    def __init__(self, controller, output_size,
                  memory_slots = 32, slot_size = 10,
                  read_heads = 1,
                  batch_size = 10):
-        self.controller_size = controller_size
+        """
+            NTM.__init__(controller, memory_slots, slot_size, read_heads, batch_size) -> None
+
+            initializes a Neural Turing Machine
+
+            @param controller: controller is another class, which must have a method called `forward` and another called `get_weights`. This controller will process the read_vectors and the external input. This implemenation modularizes the NTM, meaning that the controller can be defined however the user wants to.
+            @param memory_slots: the value M, the number of memory slots we have available
+            @param slot_size: the value N, how much data can be stored in each individual slot
+            @param read_heads: the number of read heads we have
+            @param batch_size: batch size
+        """
+
+        self.controller = controller
+        self.output_size = output_size
+
+        # This represents the OUTPUT size of the controller
+        self.controller_size = controller.size
 
         self.memory_slots = memory_slots 
         self.slot_size = slot_size
@@ -23,18 +39,131 @@ class NTM:
                                     slot_size = self.slot_size,
                                     batch_size = self.batch_size
                                     ) for i in range (read_heads)]
-        self.write_heads = writeHead(controller_size = self.controller_size,
+        self.write_head = writeHead(controller_size = self.controller_size,
                                      memory_slots = self.memory_slots,
                                      slot_size = self.slot_size,
                                      batch_size = self.batch_size)
     
-    # sequences, prior results, non_sequences
-    def process(self, data, ):
-        """ 
-            process()
-        """
-        pass
+        self.output_weight = init_weight(self.controller_size, self.output_size)
+
+        self.weights = [self.output_weight]
+        for head in self.read_heads:
+            self.weights += head.get_weights()
+        
+        self.weights += self.write_head.get_weights()
+        self.weights += self.controller.get_weights()
     
+    # sequences, prior results, non_sequences
+    def process_step(self, external_input, memory, read_vectors, previous_weights):
+        """ 
+            NTM.process(external_input, read_vector, previous_weights) -> new_memory, new_read_vectors, new_weights, output
+
+            the main method of this entire program. Processes the data with a NTM.
+
+            @param external_input: a batchsize x input_size matrix that represents the data for this timestep
+            @param memory: a batchsize x N x M memory 3-tensor from the previous timestep
+            @param read_vector: a self.read_heads x batchsize x N 3-tensor that represents all of the read vectors produced by read heads
+            @param previous_weights: a 1 + self.read_heads x batchsize x M 3-tensor that represents all of the weightings produced by all heads in the previous timestep
+        """
+
+        # concatenated_read_vector -> batchsize x self.slot_size * read_vector
+        concatenated_read_vector = T.concatenate([read_vectors[head] for head in range (len(self.read_heads))], axis = 1)
+
+        # concatenated_input -> batchsize x self.slot_size * read_vector + external_input_length
+        concatenated_input = T.concatenate([concatenated_read_vector, external_input], axis = 1)
+
+        # controller_output -> batchsize x self.controller_size
+        controller_output = T.nnet.relu(self.controller.forward(concatenated_input))
+
+        # Represents NTM's actual output for this timestep
+        # ntm_output -> batchsize x self.output_size
+        ntm_output = T.dot(controller_output, self.output_weight)
+
+        # let's get reading out of the way first
+        for head in range (len(self.read_heads)):
+            key, shift, sharpen, strengthen, interpolation = self.read_heads[head].produce(controller_output)
+
+            # preprocess the values in preparation for mem_focus
+            # key -> batchsize x 1 x N
+            # strengthen -> batchsize x 1 (already good)
+            key = key.dimshuffle([0, 'x', 1])
+
+            # Focus by content + strengthen
+            # preliminary_weight -> batchsize x M
+            preliminary_weight = mem_focus(memory, key, strengthen)
+
+            # Focus by location 
+            interpolated_weight = interpolation * preliminary_weight + (1 - interpolation) * previous_weights[head]
+
+            # Shift
+            # Both arguments are batchsize x M, first being weighting, second being shift
+
+            shifted_weight = focus_shift(interpolated_weight, shift)
+
+            # Sharpen
+            # We added broadcasted the second axis of sharpen, remember? :))))))))))))))))))))))))))
+            # sharpened_weight -> batchsize x M
+            sharpened_weight = shifted_weight ** sharpen
+
+            # Normalize
+            # T.sum(...) -> batchsize x 1
+            final_weight = sharpened_weight / T.sum(sharpened_weight, axis = 1, keepdims = True)
+
+            # read, read, read!
+            # read_vec -> batchsize x N x 1, so we gotta flatten to batchsize x N 
+            read_vec = mem_read(memory, final_weight)
+            read_vectors = T.set_subtensor(read_vectors[head], T.flatten(read_vec, outdim = 2))
+
+            previous_weights = T.set_subtensor(previous_weights[head], final_weight)
+        
+        # let's write now!
+        key, add, erase, shift, sharpen, strengthen, interpolation = self.write_head.produce(controller_output)
+
+        # preprocess the values in preparation for mem_focus
+        # key -> batchsize x 1 x N
+        # strengthen -> batchsize x 1 (already_good)
+
+        key = key.dimshuffle([0, 'x', 1])
+
+        # Focus by content + strengthen
+        # preliminary_weight -> batchsize x M
+        preliminary_weight = mem_focus(memory, key, strengthen)
+
+        # Focus by location 
+        interpolated_weight = interpolation * preliminary_weight + (1 - interpolation) * previous_weights[-1]
+
+        # Shift
+        shifted_weight = focus_shift(interpolated_weight, shift)
+
+        # Sharpen
+        sharpened_weight = shifted_weight ** sharpen
+
+        # Normalize
+        # T.sum(...) -> batchsize x 1
+        final_weight = sharpened_weight / T.sum(sharpened_weight, axis = 1, keepdims = True)
+
+        previous_weights = T.set_subtensor(previous_weights[-1], final_weight)
+        
+        # preprocess the values in preparation for mem_write
+        # weighting -> batchsize x 1 x M
+        # erase_vector -> batchsize x N x 1
+        # add_vector -> batchsize x N x 1
+        final_weight = final_weight.dimshuffle([0, 'x', 1])
+        erase = erase.dimshuffle([0, 1, 'x'])
+        add = add.dimshuffle([0, 1, 'x'])
+
+        new_memory = mem_write(memory, final_weight, erase, add)
+
+        # phew, almost done!
+        return new_memory, read_vectors, previous_weights, ntm_output
+    
+
+     #external_input, memory, read_vectors, previous_weights
+
+    def process(self, data):
+        [memory_states, read_vector_states, previous_weight_states, output_states], updates = theano.scan(fn = self.process_step, sequences = data, outputs_info = [theano.shared(np.random.randn(self.batch_size, self.slot_size, self.memory_slots) * 0.05), T.zeros(shape = [len(self.read_heads), self.batch_size, self.slot_size]), T.zeros(shape = [len(self.read_heads) + 1, self.batch_size, self.memory_slots]), None])
+
+        return memory_states, read_vector_states, previous_weight_states, output_states
 
 class readHead:
     def __init__(self, controller_size,
@@ -53,7 +182,10 @@ class readHead:
                             "controller->strengthen"    : init_weight(self.controller_size, 1),
                             "controller->interpolation" : init_weight(self.controller_size, 1),
                        }
-        
+    
+    def get_weights(self):
+        return [self.weights[key] for key in self.weights]
+
     def produce(self, controller):
         """
             readHead.recurrence(controller, previous_weight) -> key           (batchsize x N),
@@ -92,7 +224,7 @@ class readHead:
 
         interpolation = T.nnet.sigmoid(T.dot(controller, self.weights["controller->interpolation"]))        # SIGMOID
 
-        return key, true_shift, sharpen, strengthen, interpolation
+        return key, true_shift, T.addbroadcast(sharpen, 1), T.addbroadcast(strengthen, 1), T.addbroadcast(interpolation, 1)
 
 class writeHead:
     def __init__(self, controller_size,
@@ -114,7 +246,9 @@ class writeHead:
                             "controller->strengthen"    : init_weight(self.controller_size, 1),
                             "controller->interpolation" : init_weight(self.controller_size, 1),
                        }
-    
+    def get_weights(self):
+        return [self.weights[key] for key in self.weights]
+
     def produce(self, controller):
         """
             writeHead.recurrence(controller, previous_weight) -> key           (batchsize x N),
@@ -157,7 +291,7 @@ class writeHead:
 
         interpolation = T.nnet.sigmoid(T.dot(controller, self.weights["controller->interpolation"]))        # SIGMOID
 
-        return key, add, erase, true_shift, sharpen, strengthen, interpolation
+        return key, add, erase, true_shift, T.addbroadcast(sharpen, 1), T.addbroadcast(strengthen, 1), T.addbroadcast(interpolation, 1)
 
 def softplus(x):
     """
@@ -291,6 +425,18 @@ def focus_shift(weight, shift):
 
     return new_weighting.dimshuffle([1, 0])
 
+def RMSprop(cost, params, lr=0.001, rho=0.9, epsilon=1e-6):
+    grads = T.grad(cost=cost, wrt=params)
+    updates = []
+    for p, g in zip(params, grads):
+        acc = theano.shared(p.get_value() * 0.)
+        acc_new = rho * acc + (1 - rho) * g ** 2
+        gradient_scaling = T.sqrt(acc_new + epsilon)
+        g = g / (gradient_scaling + 1e-10)
+        updates.append((acc, acc_new))
+        updates.append((p, p - lr * g))
+    return updates
+
 def pass_or_fail(correct, answer):
     if (np.sum((correct - answer) ** 2) < 0.01):
         print("PASSED") 
@@ -410,12 +556,150 @@ def test():
 
     f = theano.function([c], values)
     answer = f(controller)
+    # </readHead TEST> PASSED 
 
-    print (answer)
+    # <NTM TEST>
+    class Controller:
+        def __init__(self):
+            self.size = 20
+
+            self.weight_1 = init_weight(15, 20)
+        
+        def get_weights(self):
+            return [self.weight_1]
+        
+        def forward(self, inp):
+            return T.dot(inp, self.weight_1)
+
+    ntm = NTM(controller = Controller(), output_size = 10, memory_slots = 5, slot_size = 2, read_heads = 1, batch_size = 3)
+
+    #external_input, memory, read_vectors, previous_weights
+    # five read heads, both reading a vector of size 2, add ten, only leaves room for 5 external input nodes
+    e_i = T.matrix() 
+    ext_inp = np.random.randn(3, 13) * 0.1
+
+    # batchsize x slot_size x memory_slots (batchsize x N x M)
+    m = T.tensor3()
+    mem = np.random.randn(3, 2, 5) * 0.1
+
+    # read_heads x batchsize x slot_size
+    r_v = T.tensor3()
+    read_vec = np.zeros([1, 3, 2])
+
+    # read_heads + write_head x batchsize x memory_slots
+    p_w = T.tensor3()
+    previous_w = np.zeros([2, 3, 5])
+
+    step = ntm.process_step(e_i, m, r_v, p_w)
+
+    f = theano.function([e_i, m, r_v, p_w], step)
+    answer = f(ext_inp, mem, read_vec, previous_w)
+    for a in answer:
+        print (a.shape)
+
+    # tt x batchsize x data_size
+    data = T.tensor3()
+    f = theano.function([data], ntm.process(data))
+
+    answer = f(np.zeros(shape = [20, 3, 13]) + 15)
+    for a in answer:
+        print(a.shape)
+
+    outputs = answer[-1]
+    outputs = outputs[:, 0, :]
+
 
 def main():
-    pass
+    # The big cheese, we're doin it guys!
 
-test()
+    # COPY TASK, copy a 20 length tensor of random numbers. Each section will contain 5 bits, one of which (bits 0 - 3) will be on.
+    # We'll input the 20 length, then input an end token, which will be the 5th bit (or 4th if using zero-based indexing), then input another 20 length with all zeros. This signals to the NTM that it needs to start outputting the copy. 
+
+    class Controller:
+        def __init__(self):
+            # Output size is 5, because it needs to output the copied 5 bits 
+            self.size = 128
+
+            # We'll have 1 read head, which produces a single read_vector of size 10. We also need to feed in the input, which is of size 5 (for the five bits)
+            # so our total input size is 15
+            self.fc_1 = init_weight(15, 128)
+            self.fc_2 = init_weight(128, 128)
+
+            # This is our controller output 
+            self.fc_3 = init_weight(128, 128)
+
+        def get_weights(self):
+            return [self.fc_1, self.fc_2, self.fc_3]
+
+        def forward(self, inp):
+            fc1 = T.nnet.relu(T.dot(inp, self.fc_1))
+            fc2 = T.nnet.relu(T.dot(fc1, self.fc_2))
+
+            # I would ReLU the output, but I already did in the NTM implementation
+            fc3 = T.dot(fc2, self.fc_3)
+            
+            return fc3 
+
+    # output size is 5, for the 5 copy bits
+    ntm = NTM(controller = Controller(), output_size = 5, memory_slots = 32, slot_size = 10, read_heads = 1, batch_size = 10)
+
+    data = T.tensor3()
+    target = T.tensor3()
+
+    memory_states, _, _, ntm_outputs = ntm.process(data)
+    
+    # We average the loss across batches, so that we have a singular loss for each timestep. We then average these losses
+    # ntm_outputs - target ** 2 -> ts x batchsize x bits
+    # 
+
+    loss = T.mean(T.mean(T.sum(.5 * (ntm_outputs - target) ** 2, axis = 2), axis = 1), axis = 0)
+
+    updates = RMSprop(cost = loss, params = ntm.weights, lr = 1e-3)
+    
+    train = theano.function(inputs = [data, target], outputs = list(ntm.process(data)) + [loss], updates = updates)
+
+    # let's feed a test example
+    # ts x batchsize x bits
+
+    end = np.zeros([1, 10, 5])
+    for batch in range (10):
+        end[0, batch, -1] = 1           # Make the last bit in each batch a 1
+
+    for example in range (100):
+        # Produce the first half
+        first_half = np.random.randn(20, 10, 5) > 0
+
+        for batch in range (10):
+            first_half[:, batch, -1] = 0        # Make sure the last bit (end bit) of each batch is 0
+
+        # Produce second half
+        second_half = np.zeros([20, 10, 5])     # Just a bunch of zeros 
+
+        data = np.concatenate([first_half, end, second_half], axis = 0)
+        target = np.concatenate([second_half, end, first_half], axis = 0)
+
+        # lamar gotta have that extra timestep for the end bit
+        outputs = train(data, target)
+
+        print("LOSS " + str(outputs[-1]))
+
+        outputs = outputs[-2]
+        outputs = outputs[:, 0, :]
+        
+        #plt.imshow(outputs)
+        #plt.show()
+    
+
+        """
+        fig = plt.figure()
+        fig.add_subplot(2, 2, 1) 
+        plt.imshow(data[:, 0, :], origin = [0, 0])
+        fig.add_subplot(2, 2, 2)
+        plt.imshow(target[:, 0, :], origin = [10, 0])
+        plt.show()
+        """
+
+#test()
+main()
 
 
