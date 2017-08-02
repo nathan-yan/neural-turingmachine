@@ -4,9 +4,11 @@ import theano.tensor as T
 import numpy as np
 from matplotlib import pyplot as plt
 
+from six.moves import cPickle
+
 # * indicates that a dimension is broadcastable
 
-SMALL_CONSTANT = 1e-5
+SMALL_CONSTANT = 1e-8
 
 class NTM:
     def __init__(self, controller, output_size,
@@ -49,6 +51,7 @@ class NTM:
         self.output_weight = init_weight(self.controller_size, self.output_size)
 
         self.weights = [self.output_weight]
+        #self.weights = []
         for head in self.read_heads:
             self.weights += head.get_weights()
         
@@ -162,8 +165,12 @@ class NTM:
 
      #external_input, memory, read_vectors, previous_weights
 
-    def process(self, data):
-        [memory_states, read_vector_states, previous_weight_states, output_states], updates = theano.scan(fn = self.process_step, sequences = data, outputs_info = [theano.shared(np.random.randn(self.batch_size, self.slot_size, self.memory_slots) * 0.05), T.zeros(shape = [len(self.read_heads), self.batch_size, self.slot_size]) + SMALL_CONSTANT, T.zeros(shape = [len(self.read_heads) + 1, self.batch_size, self.memory_slots]) + SMALL_CONSTANT, None])
+    def process(self, data, rand):
+        prev = np.zeros(shape = [len(self.read_heads) + 1, self.batch_size, self.memory_slots])
+        for head in range (len(self.read_heads) + 1):
+            prev[head, :, 0] = 1
+
+        [memory_states, read_vector_states, previous_weight_states, output_states], updates = theano.scan(fn = self.process_step, sequences = data, outputs_info = [rand, T.zeros(shape = [len(self.read_heads), self.batch_size, self.slot_size]) + SMALL_CONSTANT, theano.shared(prev), None])
 
         return memory_states, read_vector_states, previous_weight_states, output_states
 
@@ -186,7 +193,7 @@ class readHead:
                        }
     
     def get_weights(self):
-        return [self.weights[key] for key in self.weights]
+        return [self.weights["controller->key"], self.weights["controller->shift"], self.weights["controller->sharpen"], self.weights["controller->strengthen"], self.weights["controller->interpolation"]]
 
     def produce(self, controller):
         """
@@ -249,7 +256,7 @@ class writeHead:
                             "controller->interpolation" : init_weight(self.controller_size, 1),
                        }
     def get_weights(self):
-        return [self.weights[key] for key in self.weights]
+        return [self.weights["controller->key"], self.weights["controller->add"], self.weights["controller->erase"], self.weights["controller->shift"], self.weights["controller->sharpen"], self.weights["controller->strengthen"], self.weights["controller->interpolation"]]
 
     def produce(self, controller):
         """
@@ -268,7 +275,7 @@ class writeHead:
 
         # key, add, erase -> batchsize x N
         key = T.dot(controller, self.weights["controller->key"])
-        add = T.dot(controller, self.weights["controller->add"])
+        add = T.tanh(T.dot(controller, self.weights["controller->add"]))
         erase = T.nnet.sigmoid(T.dot(controller, self.weights["controller->erase"]))        # SIGMOID
 
         # shift -> batchsize x 3 
@@ -308,7 +315,7 @@ def softplus(x):
     return result
 
 def init_weight(input_size, output_size):
-    return theano.shared((np.random.randn(input_size, output_size) * np.sqrt(2 / (input_size + output_size))))
+    return theano.shared((np.random.randn(input_size, output_size) * np.sqrt(3 / (input_size + output_size))))
 
 def mem_write(memory, weighting, erase_vector, add_vector):
     """
@@ -373,7 +380,7 @@ def mem_focus(memory, key, strength):
     cosine_similarity = dot/(multiplied_magnitude + SMALL_CONSTANT)
 
     # strengthened_cosine_similarity -> batchsize x 1 x M
-    strengthened_cosine_similarity = cosine_similarity * strength.dimshuffle([0, 1, 'x'])
+    strengthened_cosine_similarity = cosine_similarity * strength.dimshuffle([0, 1, 'x']) 
 
     # weighting -> batchsize x M
     weighting = T.nnet.softmax(T.flatten(strengthened_cosine_similarity, outdim = 2))
@@ -392,7 +399,7 @@ def circular_convolution(weight_idx, shift, weight):
     """
 
     def conv(shift_idx, current_value, shift, weight_idx, weight):
-        current_value += weight[:, shift_idx] * shift[:, (weight_idx - shift_idx)%5]
+        current_value += weight[:, shift_idx] * shift[:, (weight_idx - shift_idx)%20]
 
         return current_value
 
@@ -610,96 +617,244 @@ def test():
     outputs = answer[-1]
     outputs = outputs[:, 0, :]
 
+def sigmoid(x):
+    return 1/(1 + np.exp(-x))
+
 
 def main():
-    # The big cheese, we're doin it guys!
+    train = False
+    weight_path = ""
 
-    # COPY TASK, copy a 20 length tensor of random numbers. Each section will contain 5 bits, one of which (bits 0 - 3) will be on.
-    # We'll input the 20 length, then input an end token, which will be the 5th bit (or 4th if using zero-based indexing), then input another 20 length with all zeros. This signals to the NTM that it needs to start outputting the copy. 
-
-    class Controller:
-        def __init__(self):
-            # Output size is 5, because it needs to output the copied 5 bits 
-            self.size = 128
-
-            # We'll have 1 read head, which produces a single read_vector of size 10. We also need to feed in the input, which is of size 5 (for the five bits)
-            # so our total input size is 15
-            self.fc_1 = init_weight(15, 128)
-            self.fc_2 = init_weight(128, 128)
-
-            # This is our controller output 
-            self.fc_3 = init_weight(128, 128)
-
-        def get_weights(self):
-            return [self.fc_1, self.fc_2, self.fc_3]
-
-        def forward(self, inp):
-            fc1 = T.nnet.relu(T.dot(inp, self.fc_1))
-            fc2 = T.nnet.relu(T.dot(fc1, self.fc_2))
-
-            # I would ReLU the output, but I already did in the NTM implementation
-            fc3 = T.dot(fc2, self.fc_3)
-            
-            return fc3 
-
-    # output size is 5, for the 5 copy bits
-    ntm = NTM(controller = Controller(), output_size = 5, memory_slots = 32, slot_size = 10, read_heads = 1, batch_size = 10)
-
-    data = T.tensor3()
-    target = T.tensor3()
-
-    memory_states, _, _, ntm_outputs = ntm.process(data)
-    
-    # We average the loss across batches, so that we have a singular loss for each timestep. We then average these losses
-    # ntm_outputs - target ** 2 -> ts x batchsize x bits
-    # 
-
-    loss = T.sum(T.mean(T.sum(.5 * (ntm_outputs - target) ** 2, axis = 2), axis = 1), axis = 0)
-
-    updates = RMSprop(cost = loss, params = ntm.weights, lr = 1e-3)
-    
-    train = theano.function(inputs = [data, target], outputs = list(ntm.process(data)) + [loss], updates = updates)
-
-    # let's feed a test example
-    # ts x batchsize x bits
-
-    end = np.zeros([1, 10, 5])
-    for batch in range (10):
-        end[0, batch, -1] = 1           # Make the last bit in each batch a 1
-
-    for example in range (100):
-        # Produce the first half
-        first_half = np.random.randn(20, 10, 5) > 0
-
-        for batch in range (10):
-            first_half[:, batch, -1] = 0        # Make sure the last bit (end bit) of each batch is 0
-
-        # Produce second half
-        second_half = np.zeros([20, 10, 5])     # Just a bunch of zeros 
-
-        data = np.concatenate([first_half, end, second_half], axis = 0)
-        target = np.concatenate([second_half, end, first_half], axis = 0)
-
-        # lamar gotta have that extra timestep for the end bit
-        outputs = train(data, target)
-
-        print("LOSS " + str(outputs[-1]))
-
-        outputs = outputs[-2]
-        outputs = outputs[:, 0, :]
+    if train:
+        # The big cheese, we're doin it guys!
         
-        plt.imshow(outputs)
-        plt.show()
-    
-
-        """
+        plt.ion()
         fig = plt.figure()
-        fig.add_subplot(2, 2, 1) 
-        plt.imshow(data[:, 0, :], origin = [0, 0])
-        fig.add_subplot(2, 2, 2)
-        plt.imshow(target[:, 0, :], origin = [10, 0])
-        plt.show()
-        """
+
+        # COPY TASK, copy a 20 length tensor of random numbers. Each section will contain 5 bits, one of which (bits 0 - 3) will be on.
+        # We'll input the 20 length, then input an end token, which will be the 5th bit (or 4th if using zero-based indexing), then input another 20 length with all zeros. This signals to the NTM that it needs to start outputting the copy. 
+
+        class Controller:
+            def __init__(self):
+                # Output size is 5, because it needs to output the copied 5 bits 
+                self.size = 128
+
+                # We'll have 1 read head, which produces a single read_vector of size 10. We also need to feed in the input, which is of size 5 (for the five bits)
+                # so our total input size is 15
+                self.fc_1 = init_weight(15, 128)
+                self.fc_2 = init_weight(128, 128)
+
+                # This is our controller output 
+                self.fc_3 = init_weight(128, 128)
+
+            def get_weights(self):
+                return [self.fc_1, self.fc_2, self.fc_3]
+
+            def forward(self, inp):
+                fc1 = T.nnet.relu(T.dot(inp, self.fc_1))
+                fc2 = T.nnet.relu(T.dot(fc1, self.fc_2))
+
+                # I would ReLU the output, but I already did in the NTM implementation
+                fc3 = T.dot(fc2, self.fc_3)
+                
+                return fc3 
+
+        # output size is 5, for the 5 copy bits
+        ntm = NTM(controller = Controller(), output_size = 5, memory_slots = 20, slot_size = 10, read_heads = 1, batch_size = 10)
+
+        data = T.tensor3()
+        target = T.tensor3()
+
+        #r = theano.shared(np.random.randn(10, 10, 20))
+        r = theano.shared(1.)
+        r_ = theano.shared(np.zeros([10, 10, 20])) + r
+
+        if weight_path != '':
+            # Load weights, but just the NTM weights, not memory, since we may extend it
+            checkpoint = open(weight_path, 'rb')
+            
+            all_weights = ntm.weights
+            for w in all_weights:
+                w.set_value(cPickle.load(checkpoint).get_value())
+            checkpoint.close()
+
+        memory_states, _, weightings, ntm_outputs = ntm.process(data, r_)
+        
+        # We average the loss across batches, so that we have a singular loss for each timestep. We then average these losses
+        # ntm_outputs - target ** 2 -> ts x batchsize x bits
+        # 
+
+        loss = T.sum(T.mean(T.sum(5 * (T.nnet.sigmoid(ntm_outputs) - target) ** 2, axis = 2), axis = 1), axis = 0)
+
+        updates = RMSprop(cost = loss, params = ntm.weights + [r], lr = 1e-3)
+        
+        train = theano.function(inputs = [data, target], outputs = [memory_states, weightings, weightings, ntm_outputs, loss, updates[2][1]], updates = updates)
+
+        for example in range (5000):
+            # Produce the first half
+            
+            # let's feed a test example
+            # ts x batchsize x bits
+
+            end = np.zeros([1, 10, 5])
+            for batch in range (10):
+                end[0, batch, -1] = 1           # Make the last bit in each batch a 1
+
+            first_half = (np.random.randn(10, 10, 5) > 0).astype(np.float32) * 1
+
+            for batch in range (10):
+                first_half[:, batch, -1] = 0        # Make sure the last bit (end bit) of each batch is 0
+
+            # Produce second half
+            second_half = np.zeros([10, 10, 5])     # Just a bunch of zeros 
+
+            data = np.concatenate([first_half, end, second_half], axis = 0)
+            target = np.concatenate([second_half, end, first_half], axis = 0)
+
+            # lamar gotta have that extra timestep for the end bit
+            outputs = train(data, target)
+
+            print("LOSS " + str(outputs[-2]) + ", " + str(example))
+
+            read = outputs[2]
+            read = read[:, 0, 0, :]
+
+            write = outputs[2]
+            write = write[:, 1, 0, :]
+
+            outputs = outputs[3]
+            outputs = outputs[:, 0]
+
+            #.transpose([1, 0])
+            
+            if (example % 20 == 0 and example != 0):
+                fig.add_subplot(2, 2, 1)
+                plt.imshow(sigmoid(outputs))
+                fig.add_subplot(2, 2, 2)
+                plt.imshow(target[:, 0])
+                fig.add_subplot(2, 2, 3)
+                plt.imshow(read)
+                fig.add_subplot(2, 2, 4)
+                plt.imshow(write)
+                plt.pause(0.1)
+
+            if (example % 500 == 0):
+                print ("SAVING WEIGHTS")
+                f = open('model-constant-mem_' + str(example) + '.save', 'wb')
+                for w in ntm.weights + [r]:
+                    cPickle.dump(w, f, protocol=cPickle.HIGHEST_PROTOCOL)
+                
+                f.close()
+        
+
+            """
+            fig = plt.figure()
+            fig.add_subplot(2, 2, 1) 
+            plt.imshow(data[:, 0, :], origin = [0, 0])
+            fig.add_subplot(2, 2, 2)
+            plt.imshow(target[:, 0, :], origin = [10, 0])
+            plt.show()
+            """
+    else:
+        # Test time!
+
+        plt.ion()
+        fig = plt.figure()
+
+        # COPY TASK, we're going to see how well our Neural Turing Machine model extends to longer sequences
+
+        class Controller:
+            def __init__(self):
+                # Output size is 5, because it needs to output the copied 5 bits 
+                self.size = 128
+
+                # We'll have 1 read head, which produces a single read_vector of size 10. We also need to feed in the input, which is of size 5 (for the five bits)
+                # so our total input size is 15
+                self.fc_1 = init_weight(15, 128)
+                self.fc_2 = init_weight(128, 128)
+
+                # This is our controller output 
+                self.fc_3 = init_weight(128, 128)
+
+            def get_weights(self):
+                return [self.fc_1, self.fc_2, self.fc_3]
+
+            def forward(self, inp):
+                fc1 = T.nnet.relu(T.dot(inp, self.fc_1))
+                fc2 = T.nnet.relu(T.dot(fc1, self.fc_2))
+
+                # I would ReLU the output, but I already did in the NTM implementation
+                fc3 = T.dot(fc2, self.fc_3)
+                
+                return fc3 
+
+        # output size is 5, for the 5 copy bits
+        ntm = NTM(controller = Controller(), output_size = 5, memory_slots = 20, slot_size = 10, read_heads = 1, batch_size = 10)
+
+        data = T.tensor3()
+        r = theano.shared(np.random.randn(10, 10, 20))
+
+        # Load weights
+        checkpoint = open('model_2000.save', 'rb')
+        
+        all_weights = ntm.weights + [r]
+        for w in all_weights:
+            w.set_value(cPickle.load(checkpoint).get_value())
+        checkpoint.close()
+
+        memory_states, _, weightings, ntm_outputs = ntm.process(data, r)
+
+        test = theano.function(inputs = [data], outputs = [memory_states, weightings, weightings, ntm_outputs])
+
+        print(r.get_value())
+
+        for example in range (5000):
+            # Produce the first half
+            
+            # let's feed a test example
+            # ts x batchsize x bits
+
+            end = np.zeros([1, 10, 5])
+            for batch in range (10):
+                end[0, batch, -1] = 1           # Make the last bit in each batch a 1
+
+            first_half = (np.random.randn(15, 10, 5) > .7).astype(np.float32) * 1
+
+            for batch in range (10):
+                first_half[:, batch, -1] = 0        # Make sure the last bit (end bit) of each batch is 0
+
+            # Produce second half
+            second_half = np.zeros([15, 10, 5])     # Just a bunch of zeros 
+
+            data = np.concatenate([first_half, end, second_half], axis = 0)
+
+            # lamar gotta have that extra timestep for the end bit
+            outputs = test(data)
+
+            read = outputs[2]
+            read = read[:, 0, 0, :]
+
+            write = outputs[2]
+            write = write[:, 1, 0, :]
+
+            outputs = outputs[3]
+            outputs = outputs[:, 0]
+
+            #.transpose([1, 0])
+            
+            cmap = 'jet'
+
+            fig.add_subplot(2, 2, 1)
+            plt.imshow(sigmoid(outputs), cmap = cmap)
+            fig.add_subplot(2, 2, 2)
+            plt.imshow(data[:, 0], cmap = cmap)
+            fig.add_subplot(2, 2, 3)
+            plt.imshow(read, cmap = cmap)
+            fig.add_subplot(2, 2, 4)
+            plt.imshow(write, cmap = cmap)
+            plt.pause(0.1)
+
+            input("")
 
 #test()
 main()
